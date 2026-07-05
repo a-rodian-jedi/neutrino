@@ -45,25 +45,38 @@ func main() {
 
 	var wg sync.WaitGroup
 
-	execveMonitor := execve.NewExecveMonitor(ctx, logger)
-	execveResults := make(chan event.Event)
+	// eventPool causes X (500, in this hardcoded case) number of *event.Events to be
+	// allocated all at once and in play at a time. This means at higher throughput
+	// levels we operate faster, GC works less (which means lower pause on cycle), and
+	// our footprint is overall lower. At low traffic levels Get/Put of sync.Pool can
+	// cause overhead that actually slows the agent down, but that should not matter
+	// since the traffic levels are already low.
+	// TODO: This could be wrapped in an EventPool object to dictate max size, etc, in the
+	// case of extra allocation we could drop overflow to the GC. Additionally, this would
+	// make the system more tunable.
+	eventPool := sync.Pool{
+		New: func() any {
+			return &event.Event{}
+		},
+	}
+	// pre-warm the pool with 500 events, hopefully enough to not need allocation again
+	for i := 0; i < 500; i++ {
+		eventPool.Put(&event.Event{})
+	}
+
+	events := make(chan *event.Event, 500)
+
+	// ── Execve Monitor ────────────────────────────
+	execveMonitor := execve.NewExecveMonitor(ctx, logger, &eventPool)
 	wg.Add(1)
 	go func() {
 		defer wg.Done()
-		execveMonitor.Run(execveResults)
+		execveMonitor.Run(events)
 	}()
+	// ── TCP Connect Monitor ────────────────────────────
+	// TCP Connect runner goes here, and also writes to events
 
 	wg.Wait()
 
 	logger.Info("exiting")
-
-	// Loading TCP Connections
-	// var tcp_objs bpf.TCPObjects
-	// if err := bpf.LoadTCPConnections(&tcp_objs, nil); err != nil {
-	// 	log.Fatalf("load eBPF tcp connections: %v", err)
-	// }
-	// defer tcp_objs.Close()
-
-	// slog.Info("eBPF TCP connections loaded successfully")
-
 }

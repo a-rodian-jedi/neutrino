@@ -1,17 +1,15 @@
 package execve
 
 import (
-	"bytes"
 	"context"
-	"encoding/binary"
 	"errors"
 	"log"
 	"log/slog"
 	"sync"
+	"unsafe"
 
 	"github.com/a-rodian-jedi/neutrino/dto/event"
 	"github.com/a-rodian-jedi/neutrino/ebpf"
-	"github.com/a-rodian-jedi/neutrino/internal/convert"
 	"github.com/cilium/ebpf/link"
 	"github.com/cilium/ebpf/ringbuf"
 )
@@ -23,11 +21,18 @@ type ExecveMonitor struct {
 	logger *slog.Logger
 	objs   ebpf.Objects
 	tp     link.Link
-	wg     *sync.WaitGroup
+	rd     *ringbuf.Reader
+	pool   *sync.Pool
 }
 
-func NewExecveMonitor(ctx context.Context, l *slog.Logger) *ExecveMonitor {
+// NewExecveMonitor returns a pointer to a fresh ExecveMonitor object.
+// Additionally, it loads eBPF execve objects, attaches to the tracepoint, and
+// provisions a reader for the eBPF ring buffer.
+func NewExecveMonitor(ctx context.Context, l *slog.Logger, p *sync.Pool) *ExecveMonitor {
 	var objs ebpf.Objects
+
+	// Note: could check args here and give more friendly error messages rather than waiting for
+	// nil dereference later if something is missing
 
 	l.Debug("Loading Execve Objects")
 	if err := ebpf.LoadObjects(&objs, nil); err != nil {
@@ -42,31 +47,31 @@ func NewExecveMonitor(ctx context.Context, l *slog.Logger) *ExecveMonitor {
 	}
 	l.Info("attached to tracepoint", "group", "sched", "name", "sched_process_exec")
 
+	rd, err := ringbuf.NewReader(objs.Events)
+	if err != nil {
+		log.Fatalf("creating ring buffer reader: %v", err)
+	}
+
+	context.AfterFunc(ctx, func() {
+		rd.Close()
+	})
+
 	return &ExecveMonitor{
 		ctx:    ctx,
 		logger: l,
 		objs:   objs,
 		tp:     tp,
+		rd:     rd,
+		pool:   p,
 	}
 }
 
-func (em *ExecveMonitor) Run(out chan<- event.Event) {
-	rd, err := ringbuf.NewReader(em.objs.Events)
-	if err != nil {
-		log.Fatalf("creating ring buffer reader: %v", err)
-	}
-	defer rd.Close()
-	em.logger.Info("execve monitor started -- listening for process executions")
-
-	context.AfterFunc(em.ctx, func() {
-		rd.Close()
-	})
-
-	var evt event.Event
-	var raw_evt ebpf.ExecEvent
+func (em *ExecveMonitor) Run(out chan<- *event.Event) {
+	// var raw_evt ebpf.ExecEvent
+	evt := em.pool.Get().(*event.Event)
 
 	for {
-		record, err := rd.Read()
+		record, err := em.rd.Read()
 		if err != nil {
 			if errors.Is(err, ringbuf.ErrClosed) {
 				// Reader was closed (most likely be AfterFunc)
@@ -82,10 +87,17 @@ func (em *ExecveMonitor) Run(out chan<- event.Event) {
 		}
 
 		// failure to decode event off of ring buffer
-		if err := binary.Read(bytes.NewReader(record.RawSample), binary.LittleEndian, &evt); err != nil {
-			em.logger.Error("error decoding ring buffer event", "error", err)
+		// binary.Read according to benchmarks does 2 allocations and takes around 3600ns per op
+		// if err := binary.Read(bytes.NewReader(record.RawSample), binary.LittleEndian, &raw_evt); err != nil {
+		// 	em.logger.Error("error decoding ring buffer event", "error", err)
+		// 	continue
+		// }
+		// we can replace with an unsafe but very fast alternative if desired:
+		if len(record.RawSample) < int(unsafe.Sizeof(ebpf.ExecEvent{})) {
+			em.logger.Error("buffer too small for ExecEvent", "got", len(record.RawSample), "want", int(unsafe.Sizeof(ebpf.ExecEvent{})))
 			continue
 		}
+		raw_evt := (*ebpf.ExecEvent)(unsafe.Pointer(&record.RawSample[0]))
 
 		// success
 
@@ -93,15 +105,15 @@ func (em *ExecveMonitor) Run(out chan<- event.Event) {
 		evt.PID = raw_evt.Pid
 		evt.PPID = raw_evt.Ppid
 		evt.UID = raw_evt.Uid
-		evt.Comm = convert.Int8SliceToString(raw_evt.Comm[:])
-		evt.Raw = raw_evt
+		evt.Comm = raw_evt.Comm
+		evt.Exec = *raw_evt
 
 		em.logger.Info("process_exec",
 			"pid", raw_evt.Pid,
 			"ppid", raw_evt.Ppid,
 			"uid", raw_evt.Uid,
 			"comm", evt.Comm,
-			"filename", convert.Int8SliceToString(raw_evt.Filename[:]),
+			"filename", raw_evt.Filename,
 		)
 
 		out <- evt
