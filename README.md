@@ -27,7 +27,7 @@ Below is a comparison of decoding events using standard `binary.Read` vs. the ze
 | **RunHotPathWithBinaryRead** | 324,636 | 3606 ns/op | 720 B/op | 3 allocs/op |
 | **RunHotPathWithUnsafePointer** | **44,252,791** | **26.14 ns/op** | **0 B/op** | **0 allocs/op** |
 
-The transition from a safe reflection-based read to pointer casting completely eliminates loop allocations, decreasing event processing latency from **~3.6 microseconds** per event to **~26 nanoseconds** per event—an approximate 138x speedup.
+The transition from a safe reflection-based read to pointer casting completely eliminates loop allocations, decreasing event processing latency from **~3.6 microseconds** per event to **~26 nanoseconds** per event—an approximate 138x speedup. Perhaps more important than the speed here is the lack of garbage memory being created, keeping the GC free of load by the part of the agent that will run by far most often.
 
 ## Future Bottlenecks & Roadmap
 
